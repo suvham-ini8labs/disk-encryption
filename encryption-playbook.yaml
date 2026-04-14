@@ -1,0 +1,298 @@
+# encrypt_disks.yml
+#
+# OVERVIEW
+# ─────────────────────────────────────────────────────────────────────────────
+# This playbook encrypts data disks in-place with LUKS2 on all linux_nodes.
+# It runs ONE node at a time (serial: 1). For Kubernetes nodes it cordons
+# and drains before encrypting, then uncordons when done.
+#
+# KEYFILE SETUP (do this before running the playbook)
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Generate a strong random keyfile on your Ansible controller:
+#
+#      dd if=/dev/urandom bs=64 count=1 2>/dev/null | base64 -w0 > /tmp/luks.key
+#
+# 2. Store it in Ansible Vault so it is never in plaintext on disk:
+#
+#      ansible-vault encrypt_string --stdin-name vault_luks_keyfile_content < /tmp/luks.key
+#
+#    Paste the output block into  group_vars/all/vault.yml
+#    Example vault.yml:
+#      vault_luks_keyfile_content: !vault |
+#        $ANSIBLE_VAULT;1.1;AES256
+#        ...
+#
+# 3. Delete the plaintext copy:
+#
+#      rm /tmp/luks.key
+#
+# On each node the playbook writes the keyfile to /etc/luks/disk.key (mode 0400,
+# root only) and references it in /etc/crypttab for automatic unlock at boot.
+#
+# REQUIRED HOST VARIABLES (set per host in inventory or host_vars/)
+# ─────────────────────────────────────────────────────────────────────────────
+#   encrypt_device:        /dev/sdb          # block device to encrypt
+#   encrypt_mount_point:   /data             # existing fstab mount point
+#   encryption_confirmed:  true              # safety gate - must be explicit
+#
+# USAGE
+# ─────────────────────────────────────────────────────────────────────────────
+#   ansible-playbook encrypt_disks.yml --ask-vault-pass
+#   ansible-playbook encrypt_disks.yml --vault-password-file .vault_pass
+#   ansible-playbook encrypt_disks.yml --vault-password-file .vault_pass --limit node01
+
+
+
+- name: Encrypt data disks with LUKS2
+  hosts: all 
+  become: true
+  gather_facts: true
+  serial: 1   # one node at a time - prevents cluster-wide outage
+
+  vars:
+    luks_keyfile_path: /etc/luks/disk.key
+    luks_mapper_name: "{{ encrypt_mapper_name | default('data_crypt') }}"
+
+  # ── Kubernetes pre-flight: cordon + drain ──────────────────────────────────
+  pre_tasks:
+    - name: Check if kubectl is available on the controller
+      ansible.builtin.stat:
+        path: /usr/bin/kubectl
+      register: kubectl_exists
+      delegate_to: localhost
+      become: false # remove this
+
+    - name: Cordon node (stop new pods scheduling here)
+      ansible.builtin.command: "kubectl cordon {{ inventory_hostname }}"
+      delegate_to: localhost
+      when: kubectl_exists.stat.exists
+      changed_when: true
+      become: false
+
+    - name: Drain node (evict all running pods gracefully)
+      ansible.builtin.command: >
+        kubectl drain {{ inventory_hostname }}
+        --ignore-daemonsets
+        --delete-emptydir-data
+        --grace-period=60
+        --timeout=300s
+      delegate_to: localhost
+      become: false
+      when: kubectl_exists.stat.exists
+      register: drain_result
+      changed_when: true
+
+    - name: Wait for all pods to terminate on this node
+      ansible.builtin.command: >
+        kubectl get pods --all-namespaces
+        --field-selector spec.nodeName={{ inventory_hostname }}
+        --no-headers
+      delegate_to: localhost
+      become: false
+      register: remaining_pods
+      until: remaining_pods.stdout == ""
+      retries: 20
+      delay: 15
+      when: kubectl_exists.stat.exists
+
+  tasks:
+    # ── Safety gate ────────────────────────────────────────────────────────────
+    - name: Abort if encryption not explicitly confirmed for this host
+      ansible.builtin.assert:
+        that: encryption_confirmed | default(false) | bool
+        fail_msg: >
+          Set 'encryption_confirmed: true' in inventory for {{ inventory_hostname }}
+          before running. Ensure backups are complete.
+
+    - name: Abort if encrypt_device is not defined
+      ansible.builtin.assert:
+        that:
+          - encrypt_device is defined
+          - encrypt_mount_point is defined
+        fail_msg: >
+          'encrypt_device' and 'encrypt_mount_point' must be defined
+          in inventory or host_vars for {{ inventory_hostname }}.
+
+    # ── Preflight checks ───────────────────────────────────────────────────────
+    - name: Ensure cryptsetup is installed
+      ansible.builtin.package:
+        name: cryptsetup
+        state: present
+
+    - name: Check cryptsetup version is >= 2.4 (required for in-place reencrypt)
+      ansible.builtin.shell: |
+        cryptsetup --version | grep -oP '[\d]+\.[\d]+' | head -1
+      register: cs_ver_raw
+      changed_when: false
+
+    - name: Assert cryptsetup version is sufficient
+      ansible.builtin.assert:
+        that: cs_ver_raw.stdout is version('2.4', '>=')
+        fail_msg: >
+          cryptsetup >= 2.4 is required for in-place reencrypt.
+          Found: {{ cs_ver_raw.stdout }}
+
+    - name: Confirm target device exists
+      ansible.builtin.stat:
+        path: "{{ encrypt_device }}"
+      register: dev_stat
+      failed_when: not dev_stat.stat.exists
+
+    - name: Check if device is already LUKS encrypted
+      ansible.builtin.command: "cryptsetup isLuks {{ encrypt_device }}"
+      register: already_luks
+      changed_when: false
+      failed_when: false
+
+    - name: Check if mapper device is already open
+      ansible.builtin.stat:
+        path: "/dev/mapper/{{ luks_mapper_name }}"
+      register: mapper_stat
+
+    - name: Unmount filesystem before encryption (if mounted)
+      ansible.posix.mount:
+        path: "{{ encrypt_mount_point }}"
+        state: unmounted
+      when: already_luks.rc != 0
+
+    - name: Run fsck to check filesystem before encryption
+      ansible.builtin.command: "fsck -n {{ encrypt_device }}"
+      register: fsck_result
+      changed_when: false
+      failed_when: fsck_result.rc > 1   # rc=1 means fixable errors - warn, don't block
+      when: already_luks.rc != 0
+
+    # ── Deploy keyfile ─────────────────────────────────────────────────────────
+    - name: Create /etc/luks directory for keyfile
+      ansible.builtin.file:
+        path: "{{ luks_keyfile_path | dirname }}"
+        state: directory
+        mode: "0700"
+        owner: root
+        group: root
+
+    - name: Write LUKS keyfile from vault to node
+      ansible.builtin.copy:
+        content: "{{ vault_luks_keyfile_content }}"
+        dest: "{{ luks_keyfile_path }}"
+        mode: "0400"
+        owner: root
+        group: root
+      no_log: true
+
+    # ── Encrypt in-place ───────────────────────────────────────────────────────
+    - name: Encrypt device in-place with LUKS2 (skips if already encrypted)
+      ansible.builtin.shell: |
+        cryptsetup reencrypt \
+          --encrypt \
+          --reduce-device-size 32M \
+          --type luks2 \
+          --cipher aes-xts-plain64 \
+          --key-size 512 \
+          --hash sha256 \
+          --pbkdf argon2id \
+          --key-file {{ luks_keyfile_path }} \
+          {{ encrypt_device }}
+      when: already_luks.rc != 0
+      changed_when: true
+
+    # ── Open the encrypted device ──────────────────────────────────────────────
+    - name: Open LUKS device and create mapper
+      ansible.builtin.shell: |
+        cryptsetup luksOpen \
+          --key-file {{ luks_keyfile_path }} \
+          {{ encrypt_device }} {{ luks_mapper_name }}
+      when: not mapper_stat.stat.exists
+      changed_when: true
+
+    - name: Resize filesystem to reclaim the 32MB carved for LUKS header
+      ansible.builtin.command: "resize2fs /dev/mapper/{{ luks_mapper_name }}"
+      register: resize
+      changed_when: "'already' not in resize.stdout"
+      when: already_luks.rc != 0
+
+    # ── Persist: crypttab + fstab ──────────────────────────────────────────────
+    - name: Get LUKS device UUID for crypttab
+      ansible.builtin.command: "cryptsetup luksUUID {{ encrypt_device }}"
+      register: luks_uuid
+      changed_when: false
+
+    - name: Update /etc/crypttab for auto-unlock at boot
+      ansible.builtin.lineinfile:
+        path: /etc/crypttab
+        line: "{{ luks_mapper_name }}  UUID={{ luks_uuid.stdout | trim }}  {{ luks_keyfile_path }}  luks"
+        regexp: "^{{ luks_mapper_name }}\\s"
+        create: true
+        mode: "0644"
+
+    - name: Get original device or UUID reference in fstab
+      ansible.builtin.command: "blkid -s UUID -o value {{ encrypt_device }}"
+      register: orig_uuid
+      changed_when: false
+
+    - name: Update /etc/fstab to reference the mapper device
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: "^(UUID={{ orig_uuid.stdout | trim }}|{{ encrypt_device }})([[:space:]])"
+        replace: "/dev/mapper/{{ luks_mapper_name }}\\2"
+
+    - name: Mount encrypted filesystem
+      ansible.posix.mount:
+        path: "{{ encrypt_mount_point }}"
+        src: "/dev/mapper/{{ luks_mapper_name }}"
+        fstype: ext4    # change to xfs or btrfs if needed
+        state: mounted
+
+    # ── Backup LUKS header to Ansible controller ───────────────────────────────
+    - name: Dump LUKS header backup on node
+      ansible.builtin.command: >
+        cryptsetup luksHeaderBackup {{ encrypt_device }}
+        --header-backup-file /tmp/{{ inventory_hostname }}-luks.img
+      args:
+        creates: /tmp/{{ inventory_hostname }}-luks.img
+      changed_when: true
+
+    - name: Fetch LUKS header backup to controller (./luks-backups/)
+      ansible.builtin.fetch:
+        src: /tmp/{{ inventory_hostname }}-luks.img
+        dest: ./luks-backups/{{ inventory_hostname }}-luks.img
+        flat: true
+
+    - name: Remove header backup temp file from node
+      ansible.builtin.file:
+        path: /tmp/{{ inventory_hostname }}-luks.img
+        state: absent
+
+    # ── Rebuild initramfs so boot includes crypttab ────────────────────────────
+    - name: Rebuild initramfs (Debian/Ubuntu)
+      ansible.builtin.command: update-initramfs -u
+      changed_when: true
+      when: ansible_os_family == "Debian"
+
+     # ── Verify ─────────────────────────────────────────────────────────────────
+    - name: Confirm LUKS encryption is active on mapper
+      ansible.builtin.command: "cryptsetup status {{ luks_mapper_name }}"
+      changed_when: false
+      register: crypt_status
+
+    - name: Show encryption summary
+      ansible.builtin.debug:
+        msg:
+          - "Host:         {{ inventory_hostname }}"
+          - "Device:       {{ encrypt_device }} → /dev/mapper/{{ luks_mapper_name }}"
+          - "Mounted at:   {{ encrypt_mount_point }}"
+          - "Header backup: ./luks-backups/{{ inventory_hostname }}-luks.img"
+          - "Status:       {{ crypt_status.stdout_lines[0] }}"
+
+  # ── Kubernetes post: uncordon ──────────────────────────────────────────────
+  post_tasks:
+
+    - name: Uncordon node (allow pods to schedule again)
+      ansible.builtin.command: "kubectl uncordon {{ inventory_hostname }}"
+      delegate_to: localhost
+      become: false
+      when:
+        - kubectl_exists.stat.exists
+        - drain_result is not skipped
+        - drain_result is succeeded
+      changed_when: true
