@@ -1,0 +1,35 @@
+all:
+  hosts:
+    master-1:
+      ansible_host: 10.0.0.7
+      ip: 10.0.0.7
+      access_ip: 10.0.0.7
+      encrypt_device: /dev/nvme0n2
+      encrypt_mount_point: /mnt/nvme0n2
+      encrypt_mapper_name: nvme0n2-mapper
+      encryption_confirmed: true 
+    
+    worker-1:
+      ansible_host: 10.0.0.8
+      ip: 10.0.0.8
+      access_ip: 10.0.0.8
+      encrypt_device: /dev/nvme0n2
+      encrypt_mount_point: /mnt/nvme0n2
+      encrypt_mapper_name: nvme0n2-mapper
+      encryption_confirmed: true
+  children:
+    kube_control_plane:
+      hosts:
+        master-1:
+    kube_node:
+      hosts:
+        worker-1:
+    etcd:
+      hosts:
+        master-1:
+    k8s_cluster:
+      children:
+        kube_control_plane:
+        kube_node:
+    calico_rr:
+      hosts: {}
