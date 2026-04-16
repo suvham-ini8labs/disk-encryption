@@ -482,6 +482,3 @@ Output:
 ## Resources
 
 - [Encrypting existing data on a block device using LUKS2 - Red Hat](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/8/html/security_hardening/encrypting-block-devices-using-luks_security-hardening#encrypting-existing-data-on-a-block-device-using-luks2_encrypting-block-devices-using-luks)
-
-### TODO
-- in the playbook we shouldnt use `resize2fs -f` and use without `-f`. `e2fsck -f -n` should run before `resize2fs`.but for some reason `resize2fs` errors that we need to run `e2fsck -f`.
