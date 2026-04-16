@@ -193,12 +193,14 @@
       changed_when: true 
   
     - name: Run e2fsck to check filesystem health
-      ansible.builtin.command: "e2fsck -f -y /dev/mapper/{{ luks_mapper_name }}"
+      ansible.builtin.command: "e2fsck -f -n /dev/mapper/{{ luks_mapper_name }}"
       when: already_luks.rc != 0
       failed_when: false
 
+    # -f forces resize2fs to proceed with the file system resize operation, 
+    # overriding some safety checks which resize2fs normally enforces.
     - name: Resize filesystem to reclaim the 32MB carved for LUKS header
-      ansible.builtin.command: "resize2fs /dev/mapper/{{ luks_mapper_name }}" # -f will ignore safety checks
+      ansible.builtin.command: "resize2fs -f /dev/mapper/{{ luks_mapper_name }}"
       when: already_luks.rc != 0
 
     - name: Mount encrypted filesystem
